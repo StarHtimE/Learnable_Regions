@@ -1,6 +1,7 @@
 from torchvision.utils import save_image
 from PIL import Image
 from diffusers import StableDiffusionInpaintPipeline
+from diffusers import AutoPipelineForInpainting
 from torch import autocast
 from PIL import Image
 from typing import List, Optional, Union
@@ -30,13 +31,16 @@ def inpaint(pipe, prompts, init_images, mask_images=None, latents=None, strength
 
 def init_diffusion_engine(model_path, device):
     print('Initializing diffusion model: ', model_path)
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    pipe = AutoPipelineForInpainting.from_pretrained(
         model_path,
-        revision="fp16", 
+        variant="fp16", 
         torch_dtype=torch.float16
     ).to(device)
 
     pipe.set_progress_bar_config(disable=True)
+    pipe.enable_vae_tiling()
+    pipe.enable_vae_slicing()
+    
     generator = torch.Generator(device=device).manual_seed(0)
     return pipe, generator
 
