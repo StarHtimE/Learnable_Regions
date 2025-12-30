@@ -17,6 +17,9 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision import datasets, transforms
 from engine import *
 from utils.post_process import get_final_img
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import random
 import os, jax, cv2, pdb
 import numpy as np
@@ -81,9 +84,28 @@ def predict(args, model, template, data_loader_test, device_id):
         imgs = imgs.to(device=device_id, non_blocking=True)[0].unsqueeze(0)
         o_prompt, e_prompt = o_prompt[0], e_prompt[0]
         e_prompt = compose_text_with_templates(e_prompt, template)
-        bboxs = torch.ceil(map_cooridates(model.module.get_anchor_box(imgs)))
+        if getattr(args, 'save_attn_viz', False):
+            bbox_raw, attn_map = model.module.get_anchor_box_and_attn(imgs)
+        else:
+            bbox_raw = model.module.get_anchor_box(imgs)
+            attn_map = None
+
+        bboxs = torch.ceil(map_cooridates(bbox_raw))
         imgs = imgs.repeat_interleave(bboxs.shape[0]//imgs.shape[0], 0)
         _, mask_imgs = get_mask_imgs(imgs, bboxs)
         results = model.module.generate_result(imgs, mask_imgs.to(device_id), e_prompt)
         save_img(args, data_iter_step, results, bboxs, imgs, mask_imgs, e_prompt, o_prompt)
+
+        # save attention heatmap (rank0 only, per-image)
+        if getattr(args, 'save_attn_viz', False) and dist.get_rank() == 0:
+            attn = attn_map[0].detach().cpu()  # 32x32
+            out_dir = os.path.join(args.output_dir, str(data_iter_step)+'_'+o_prompt, 'attn')
+            os.makedirs(out_dir, exist_ok=True)
+            plt.figure(figsize=(4,4))
+            plt.imshow(attn, cmap='inferno')
+            plt.axis('off')
+            plt.title('DINO attention (CLS→patch)')
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, 'attn.png'), dpi=200, bbox_inches='tight')
+            plt.close()
 
