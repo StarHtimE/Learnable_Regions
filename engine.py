@@ -47,7 +47,7 @@ def init_diffusion_engine(model_path, device):
 def generate(init_images, mask_images, pipe, generator, prompt=['lion'], device='cuda', strength=0.75, 
     guidance_scale=7.5, num_samples=1, n_iter=1):
 
-    img_size = 512
+    img_size = 1024
     transform = T.Resize(img_size)
     init_images, mask_images = transform(init_images), transform(mask_images)
     
