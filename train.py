@@ -30,6 +30,132 @@ import utils.misc as misc
 import torchvision.transforms as T
 import torch.distributed as dist
 
+
+def _maybe_dashscope_enrich(args, rank):
+    """Optionally call DashScope to get image description and edited-image description."""
+    if not (args.use_dashscope_caption or args.use_dashscope_edit_description):
+        return args
+
+    if args.json_file is not None:
+        if rank == 0:
+            print("DashScope enrichment currently supports single-image mode (image_file_path). Skipping.")
+        return args
+
+    api_key = args.dashscope_api_key or os.getenv("DASHSCOPE_API_KEY")
+    if api_key is None:
+        raise RuntimeError("DashScope API key missing. Set --dashscope_api_key or DASHSCOPE_API_KEY.")
+
+    caption = None
+    edited_desc = None
+
+    if rank == 0:
+        try:
+            import dashscope  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("dashscope is required. Install with: pip install dashscope") from exc
+
+        # ------------------------------------------------------------------
+        # 1) MLLM: image -> faithful source description (SDXL-compatible)
+        # ------------------------------------------------------------------
+        if args.use_dashscope_caption or args.image_caption is None:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": args.image_file_path},
+                        {
+                            "text": (
+                                "Describe the image for use as a diffusion model prompt.\n"
+                                "Rules:\n"
+                                "- Describe only what is visible.\n"
+                                "- Use concrete nouns and visual attributes.\n"
+                                "- Include spatial relationships when relevant.\n"
+                                "- Avoid interpretation or speculation.\n"
+                                "- Do NOT mention editing, camera, or photography terms unless obvious.\n"
+                                "- Keep it concise but complete.\n"
+                            )
+                        },
+                    ],
+                }
+            ]
+            resp = dashscope.MultiModalConversation.call(
+                api_key=api_key,
+                model=args.dashscope_vl_model,
+                messages=messages,
+            )
+            caption = resp.output.choices[0].message.content[0]["text"]
+
+        # ------------------------------------------------------------------
+        # 2) LLM: (source description + edit instruction) -> target description
+        # ------------------------------------------------------------------
+        if args.use_dashscope_edit_description:
+            base_caption = caption if caption is not None else args.image_caption
+            if base_caption is None:
+                raise RuntimeError("Cannot generate edited description without an image caption.")
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate image descriptions for an SDXL inpainting model.\n"
+                        "You act as a prompt compiler, not a conversational assistant."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Source image description:\n"
+                        f"{base_caption}\n\n"
+                        "Edit instruction:\n"
+                        f"{args.editing_prompt}\n\n"
+                        "Task:\n"
+                        "- Generate a new image description in one sentence that reflects the edit instruction.\n"
+                        "- MUST output less than 15 words.\n"
+                        "- ONLY describe objects changed, ignore details like light or environment.\n"
+                        "- Do NOT explain the changes.\n"
+                        "- Do NOT mention the original image or the editing process.\n"
+                        "- Use concrete, visual language compatible with SDXL.\n"
+                        "- Maintain original style and lighting unless instructed otherwise.\n"
+                        "\nOutput only the final image description."
+                    ),
+                },
+            ]
+
+            resp = dashscope.Generation.call(
+                api_key=api_key,
+                model=args.dashscope_text_model,
+                messages=messages,
+                result_format="message",
+            )
+            if resp.status_code == 200:
+                edited_desc = resp.output.choices[0].message.content
+            else:
+                raise RuntimeError(
+                    f"DashScope Generation failed: status={resp.status_code}, "
+                    f"code={resp.code}, message={resp.message}"
+                )
+
+    # ----------------------------------------------------------------------
+    # Distributed sync
+    # ----------------------------------------------------------------------
+    shared = [caption, edited_desc]
+    dist.broadcast_object_list(shared, src=0)
+    caption, edited_desc = shared
+
+
+    if caption is not None and (args.image_caption is None or args.override_image_caption):
+        args.image_caption = " ".join(caption.split()[:5])
+    args.editing_prompt = edited_desc
+
+    if rank == 0:
+        if caption is not None:
+            print(f"[DashScope] image_description: {caption}")
+        if edited_desc is not None:
+            print(f"[DashScope] edited_image_description: {edited_desc}")
+
+    return args
+
+
 def configure_optimizers(model, lr, betas=(0.9, 0.96), weight_decay=4.5e-2):
     optimizer = torch.optim.Adam(model.module.anchor_net.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
     return optimizer
@@ -83,6 +209,8 @@ def main(args):
     cudnn.benchmark= True
 
     template = get_augmentations_template()
+
+    args = _maybe_dashscope_enrich(args, rank)
     
     if not os.path.exists(args.save_path) and rank == 0:
         os.mkdir(args.save_path)
@@ -165,6 +293,14 @@ def get_args_parser():
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--save_attn_viz', action='store_true', help='Save attention heatmaps and anchor overlays during prediction (rank0 only).')
+    # dashscope-assisted captioning / description
+    parser.add_argument('--use_dashscope_caption', action='store_true', help='Use DashScope qwen-vl to auto caption the input image (single-image mode).')
+    parser.add_argument('--use_dashscope_edit_description', action='store_true', help='Use DashScope qwen-plus to produce edited image description (logs only).')
+    parser.add_argument('--override_image_caption', action='store_true', help='Allow DashScope caption to overwrite provided image_caption.')
+    parser.add_argument('--dashscope_api_key', type=str, default=None, help='DashScope API key; otherwise read DASHSCOPE_API_KEY env.')
+    parser.add_argument('--dashscope_vl_model', type=str, default='qwen3-vl-plus', help='DashScope VL model id.')
+    parser.add_argument('--dashscope_text_model', type=str, default='qwen-plus', help='DashScope text model id.')
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
