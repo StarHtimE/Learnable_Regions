@@ -5,7 +5,7 @@ import shutil
 import glob
 import time
 
-def run_inference(image, caption, edit_prompt):
+def run_inference(image, edit_prompt):
     # Create a unique output directory for this run
     timestamp = int(time.time())
     run_dir = f"gradio_output/run_{timestamp}"
@@ -20,19 +20,18 @@ def run_inference(image, caption, edit_prompt):
     cmd = [
         "torchrun", "--nnodes=1", "--nproc_per_node=1", "train.py",
         "--image_file_path", input_image_path,
-        "--image_caption", caption,
         "--editing_prompt", edit_prompt,
         "--output_dir", run_dir,
         "--diffusion_model_path", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
-        "--test_alpha", "2",
-        "--test_beta", "1",
-        # "--use_dashscope_caption",
-        # "--use_dashscope_edit_description",
+        "--test_alpha", "3",
+        "--test_beta", "2",
+        "--use_dashscope_caption",
+        "--use_dashscope_edit_description",
         "--dashscope_api_key", "sk-5463a1be1a5748c9ad825a54b2bceeec",
         "--draw_box",
         "--lr", "5e-3",
         "--max_window_size", "15",
-        "--per_image_iteration", "1",
+        "--per_image_iteration", "5",
         "--epochs", "1",
         "--num_workers", "8",
         "--seed", "42",
@@ -110,13 +109,13 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column(scale=1):
             input_image = gr.Image(type="pil", label="Input Image", height=500)
-            caption = gr.Textbox(label="Original Caption", value="trees")
-            edit_prompt = gr.Textbox(label="Editing Prompt", value="a big tree with many flowers in the center")
+            # caption = gr.Textbox(label="Original Caption", value="trees")
+            edit_prompt = gr.Textbox(label="Editing Prompt", value="Enter your editing prompt here")
             run_btn = gr.Button("Run")
             # status = gr.Textbox(label="Status")
         
         with gr.Column(scale=1):
-            final_output = gr.Image(label="Final Selected Image", height=300)
+            final_output = gr.Image(label="Final Selected Image", height=500)
             
     with gr.Row():
         with gr.Column():
@@ -129,7 +128,7 @@ with gr.Blocks() as demo:
 
     run_btn.click(
         fn=run_inference,
-        inputs=[input_image, caption, edit_prompt],
+        inputs=[input_image, edit_prompt],
         outputs=[gallery, box_gallery, final_output]
     )
 
